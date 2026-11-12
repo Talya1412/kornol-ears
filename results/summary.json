@@ -1,23 +1,28 @@
 {
-  "started_at": "2026-11-12T08:01:19.473Z",
-  "finished_at": "2026-11-12T08:03:19.495Z",
+  "started_at": "2026-11-12T13:58:19.737Z",
+  "finished_at": "2026-11-12T14:10:19.754Z",
   "ready": true,
   "connection_states_seen": [
     "connecting",
-    "ready"
+    "ready",
+    "signalling"
   ],
   "tone_played": true,
-  "utterance_count": 0,
-  "per_user_utterances": {},
-  "max_rms": 0,
-  "relay_sent": 0,
-  "replies_played": 1,
+  "utterance_count": 18,
+  "per_user_utterances": {
+    "1066881768097071174": 8,
+    "952052493246947329": 9,
+    "411916947773587456": 1
+  },
+  "max_rms": 6276.3,
+  "relay_sent": 10,
+  "replies_played": 4,
   "greet_sent": 1,
-  "fillers_played": 0,
-  "barges": 0,
+  "fillers_played": 5,
+  "barges": 4,
   "bus_used": true,
   "bot_moved": false,
   "live_mode": false,
   "pcm_frames_sent": 0,
-  "finish_reason": "runtime cap 2m"
+  "finish_reason": "channel empty"
 }

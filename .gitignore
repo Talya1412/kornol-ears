@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+*.token
+.token
+.voice_api_key
+voice_service_url.txt
+results/.boot-*
+results/run.log
+npm-debug.log*

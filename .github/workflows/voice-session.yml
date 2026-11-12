@@ -1,0 +1,77 @@
+name: voice-session
+
+# Runs the KORNOL ears (Node voice sidecar) on a GitHub-hosted runner —
+# a fully headless way to open a realtime voice session: the VM-side
+# voice manager dispatches this workflow when people gather in a watched
+# voice channel. The runner has open UDP egress (proven on Codespaces,
+# same Azure fabric). Results are pushed back to this repo by index.js.
+on:
+  workflow_dispatch:
+    inputs:
+      guild_id:
+        description: "Guild to join"
+        required: true
+        type: string
+      channel_id:
+        description: "Voice channel to join"
+        required: true
+        type: string
+      minutes:
+        description: "Session length cap (index.js hard cap is 45)"
+        required: false
+        type: string
+        default: "45"
+      greet_lang:
+        description: "Greeting language (es/en/vi)"
+        required: false
+        type: string
+        default: "es"
+      bus_session:
+        description: "Cloudflare voice-bus session id (empty = Discord bus)"
+        required: false
+        type: string
+        default: ""
+      live_mode:
+        description: "Gemini Live mode (1 = stream PCM to the Live gateway)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  ears:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            ~/.npm
+          key: ${{ runner.os }}-ears-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-ears-
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Run ears
+        run: node index.js
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          TEST_GUILD_ID: ${{ inputs.guild_id }}
+          TEST_VOICE_CHANNEL_ID: ${{ inputs.channel_id }}
+          OWNER_USER_ID: "935942283214344302"
+          RUN_MINUTES: ${{ inputs.minutes }}
+          RELAY_CHANNEL_ID: "943298520335675462"
+          VOICE_LOOP: "1"
+          GREET_LANG: ${{ inputs.greet_lang }}
+          BUS_URL: "wss://kornol-voice-bus.talya1412.workers.dev"
+          BUS_TOKEN: ${{ secrets.BUS_TOKEN }}
+          BUS_SESSION: ${{ inputs.bus_session }}
+          LIVE_MODE: ${{ inputs.live_mode }}

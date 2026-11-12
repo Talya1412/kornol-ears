@@ -1,0 +1,23 @@
+{
+  "started_at": "2026-11-12T07:55:05.334Z",
+  "finished_at": "2026-11-12T07:58:05.342Z",
+  "ready": true,
+  "connection_states_seen": [
+    "connecting",
+    "ready"
+  ],
+  "tone_played": true,
+  "utterance_count": 0,
+  "per_user_utterances": {},
+  "max_rms": 0,
+  "relay_sent": 0,
+  "replies_played": 1,
+  "greet_sent": 1,
+  "fillers_played": 0,
+  "barges": 0,
+  "bus_used": true,
+  "bot_moved": false,
+  "live_mode": false,
+  "pcm_frames_sent": 0,
+  "finish_reason": "runtime cap 3m"
+}

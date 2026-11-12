@@ -397,7 +397,7 @@ function decodeWavToPcm48k(buf) {
 // onDown — fired at most once — that it can no longer be used (connect
 // failure or a mid-session drop); there is no reconnection, a drop
 // means Discord transport for the rest of the session.
-function createBusClient({ url, session, token, onReply, onFiller, onSkip, onDown }) {
+function createBusClient({ url, session, token, onReply, onFiller, onSkip, onEnd, onDown }) {
   const WebSocket = require('ws');
   let sock = null;
   let open = false;
@@ -442,6 +442,13 @@ function createBusClient({ url, session, token, onReply, onFiller, onSkip, onDow
     } else if (frame.t === 'skip') {
       log(`BUS SKIP seq=${frame.seq}`);
       if (onSkip) { try { onSkip(frame); } catch (e) { log('BUS SKIP HANDLER FAIL:', e.message); } }
+    } else if (frame.t === 'end') {
+      // Graceful leave: the brain is done talking (typically right
+      // after a spoken goodbye). No binary follows an end frame, so
+      // pending is left untouched. The client stays policy-free:
+      // main() decides via onEnd when finish() actually runs.
+      log('BUS END received: finishing gracefully');
+      if (onEnd) { try { onEnd(frame); } catch (e) { log('BUS END HANDLER FAIL:', e.message); } }
     } else {
       log(`BUS UNKNOWN FRAME t=${frame.t}`);
     }
@@ -791,6 +798,31 @@ async function main() {
     startPlayback(item)
       .catch((e) => log('FILLER PLAY FAIL:', e.message))
       .finally(() => { pumpReplyQueue(); });
+  }
+
+  // Bus 'end' frame (graceful leave, max-opt 2026-11-12): the brain
+  // asks the ears to wrap up, usually right after queueing a spoken
+  // goodbye. Let whatever is sounding (plus anything already queued)
+  // play out, but never linger: finish once playback has drained
+  // (~800 ms after the request at the earliest), and in all cases
+  // within 3 s. finish() destroys the voice connection, which is
+  // what actually takes the bot out of the channel.
+  let endRequested = false;
+  function requestGracefulEnd() {
+    if (endRequested || finishing) return;
+    endRequested = true;
+    const requestedAt = Date.now();
+    const tick = () => {
+      if (finishing) return;
+      const busy = currentPlayback !== null || replyQueue.length > 0;
+      const elapsed = Date.now() - requestedAt;
+      if ((!busy && elapsed >= 800) || elapsed >= 3000) {
+        finish('leave request');
+        return;
+      }
+      setTimeout(tick, 150);
+    };
+    tick();
   }
 
   // Barge-in: while audio is playing, a human who starts speaking and
@@ -1286,6 +1318,7 @@ async function main() {
         }
       },
       onSkip: () => {},
+      onEnd: () => { requestGracefulEnd(); },
       onDown: () => {
         // Fired at most once by the client (connect failure or a
         // mid-session drop). From here on everything — utterances,

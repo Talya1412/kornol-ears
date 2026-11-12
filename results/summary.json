@@ -1,6 +1,6 @@
 {
-  "started_at": "2026-11-12T07:55:05.334Z",
-  "finished_at": "2026-11-12T07:58:05.342Z",
+  "started_at": "2026-11-12T08:01:19.473Z",
+  "finished_at": "2026-11-12T08:03:19.495Z",
   "ready": true,
   "connection_states_seen": [
     "connecting",
@@ -19,5 +19,5 @@
   "bot_moved": false,
   "live_mode": false,
   "pcm_frames_sent": 0,
-  "finish_reason": "runtime cap 3m"
+  "finish_reason": "runtime cap 2m"
 }

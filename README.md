@@ -13,7 +13,8 @@ hears to the brain, and plays back the spoken replies.
 Sessions run as GitHub Actions workflow dispatches
 (`.github/workflows/voice-session.yml`): a runner starts, the ears
 join the requested channel, greet, converse, and leave when the room
-empties; a `results/summary.json` report is pushed back at the end.
+empties. The sidecar publishes `results/summary.json` and utterance
+metrics in `results/utterances.jsonl`. Terminal logs stay with the runner.
 
 Secrets (bot token, bus token) live only in this repo's Actions
 secrets — never in the code.

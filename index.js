@@ -39,17 +39,45 @@
 const fs = require('fs');
 const path = require('path');
 const { Readable } = require('stream');
-const { exec } = require('child_process');
+const { createResultsPublisher } = require('./results-publisher');
+const {
+  SAMPLE_RATE, CHANNELS, BYTES_PER_FRAME_SAMPLE,
+  downmixStereoToMono, encodeWavPcm16Mono, decodeWavToPcm48k,
+} = require('./wav');
 
 const BASE = __dirname;
 const RESULTS_DIR = path.join(BASE, 'results');
-const SAMPLE_RATE = 48000;
-const CHANNELS = 2;
-const BYTES_PER_FRAME_SAMPLE = 2; // s16le
 const LIVE_FRAME_BYTES = 3200; // 100 ms of 16 kHz s16le mono (LIVE mode uplink)
 
 function log(...parts) {
   console.log(new Date().toISOString(), ...parts);
+}
+
+function playUntilIdle(player, resource, timeoutMs, onError) {
+  return new Promise((resolve) => {
+    let started = false;
+    const playing = () => { started = true; };
+    const idle = () => complete(started);
+    const failed = (error) => {
+      complete(false);
+      onError(error);
+    };
+    const complete = (played) => {
+      clearTimeout(timeout);
+      player.off('playing', playing);
+      player.off('idle', idle);
+      player.off('error', failed);
+      resolve(played);
+    };
+    player.once('playing', playing);
+    player.once('idle', idle);
+    player.once('error', failed);
+    const timeout = setTimeout(() => {
+      complete(false);
+      try { player.stop(true); } catch (error) { onError(error); }
+    }, timeoutMs);
+    try { player.play(resource); } catch (error) { failed(error); }
+  });
 }
 
 // ---------------------------------------------------------------- dry mode
@@ -182,8 +210,9 @@ async function busSelfTest() {
       let pendingFrame = null; // last text frame; the next binary belongs to it
       let replyDone = false;
       let pcmDone = false;
+      let endDone = false;
       const checkDone = () => {
-        if (replyDone && pcmDone) { clearTimeout(timer); resolve(); }
+        if (replyDone && pcmDone && endDone) { clearTimeout(timer); resolve(); }
       };
       wss.on('connection', (sock) => {
         // Exercise the keepalive path: the client must ignore this.
@@ -215,6 +244,7 @@ async function busSelfTest() {
               pendingFrame = null;
               sock.send(JSON.stringify({ t: 'reply', seq, chunk: 0, last: true, heard: 'selftest', text: 'selftest' }));
               sock.send(wav);
+              sock.send(JSON.stringify({ t: 'end' }));
             } else if (pendingFrame.t === 'pcm') {
               if (bin.length % 2 !== 0) { fail(new Error(`pcm binary length ${bin.length} is not a multiple of 2`)); return; }
               if (!bin.equals(pcmFrame)) { fail(new Error('server got wrong pcm bytes')); return; }
@@ -239,6 +269,11 @@ async function busSelfTest() {
         },
         onFiller: () => fail(new Error('unexpected filler in self-test')),
         onSkip: () => fail(new Error('unexpected skip in self-test')),
+        onEnd: () => {
+          if (!replyDone || endDone) { fail(new Error('unexpected end frame ordering')); return; }
+          endDone = true;
+          checkDone();
+        },
         onDown: (err) => fail(err || new Error('bus went down during self-test')),
       });
       client.connect()
@@ -277,17 +312,6 @@ function generateTonePcm(seconds) {
 // before encoding; reply WAVs (often 24 kHz mono from Gemini TTS) are
 // parsed back and upsampled to 48 kHz mono for playback.
 
-function downmixStereoToMono(stereoPcm) {
-  const frames = Math.floor(stereoPcm.length / (CHANNELS * BYTES_PER_FRAME_SAMPLE));
-  const mono = Buffer.alloc(frames * BYTES_PER_FRAME_SAMPLE);
-  for (let i = 0; i < frames; i++) {
-    const l = stereoPcm.readInt16LE(i * CHANNELS * BYTES_PER_FRAME_SAMPLE);
-    const r = stereoPcm.readInt16LE((i * CHANNELS + 1) * BYTES_PER_FRAME_SAMPLE);
-    mono.writeInt16LE(Math.round((l + r) / 2), i * BYTES_PER_FRAME_SAMPLE);
-  }
-  return mono;
-}
-
 // Decimate 48 kHz mono s16le to 16 kHz by averaging each group of 3
 // samples. `rest` carries the trailing 0-2 samples of the previous
 // chunk that did not complete a group; returns { out, rest } the same
@@ -308,73 +332,6 @@ function decimate48kTo16k(monoPcm, rest) {
   return { out, rest: Buffer.from(src.subarray(groups * 3 * BYTES_PER_FRAME_SAMPLE)) };
 }
 
-function encodeWavPcm16Mono(pcm, sampleRate) {
-  const header = Buffer.alloc(44);
-  header.write('RIFF', 0, 'ascii');
-  header.writeUInt32LE(36 + pcm.length, 4);
-  header.write('WAVE', 8, 'ascii');
-  header.write('fmt ', 12, 'ascii');
-  header.writeUInt32LE(16, 16); // fmt chunk size
-  header.writeUInt16LE(1, 20); // audio format: PCM
-  header.writeUInt16LE(1, 22); // channels: mono
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(sampleRate * BYTES_PER_FRAME_SAMPLE, 28); // byte rate
-  header.writeUInt16LE(BYTES_PER_FRAME_SAMPLE, 32); // block align
-  header.writeUInt16LE(16, 34); // bits per sample
-  header.write('data', 36, 'ascii');
-  header.writeUInt32LE(pcm.length, 40);
-  return Buffer.concat([header, pcm]);
-}
-
-// Parse a WAV buffer and return its audio as 48 kHz / 16-bit / mono PCM.
-// Other sample rates are converted by sample duplication for integer
-// ratios (24k -> x2, 16k -> x3) and nearest-neighbour otherwise, which
-// is plenty for speech.
-function decodeWavToPcm48k(buf) {
-  if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') {
-    throw new Error('not a RIFF/WAVE buffer');
-  }
-  let channels = 1;
-  let sampleRate = SAMPLE_RATE;
-  let bitsPerSample = 16;
-  let data = null;
-  let off = 12;
-  while (off + 8 <= buf.length) {
-    const id = buf.toString('ascii', off, off + 4);
-    const size = buf.readUInt32LE(off + 4);
-    const body = off + 8;
-    if (id === 'fmt ') {
-      const audioFormat = buf.readUInt16LE(body);
-      if (audioFormat !== 1) throw new Error(`unsupported WAV format ${audioFormat} (need PCM)`);
-      channels = buf.readUInt16LE(body + 2);
-      sampleRate = buf.readUInt32LE(body + 4);
-      bitsPerSample = buf.readUInt16LE(body + 14);
-    } else if (id === 'data') {
-      data = buf.subarray(body, Math.min(body + size, buf.length));
-      break;
-    }
-    off = body + size + (size % 2); // chunks are word-aligned
-  }
-  if (!data) throw new Error('WAV has no data chunk');
-  if (bitsPerSample !== 16) throw new Error(`unsupported WAV bits ${bitsPerSample} (need 16)`);
-
-  let mono;
-  if (channels === 2) mono = downmixStereoToMono(data);
-  else if (channels === 1) mono = data;
-  else throw new Error(`unsupported WAV channels ${channels}`);
-
-  if (sampleRate === SAMPLE_RATE) return { pcm: mono, sampleRate };
-  const inSamples = Math.floor(mono.length / BYTES_PER_FRAME_SAMPLE);
-  const ratio = SAMPLE_RATE / sampleRate;
-  const outSamples = Math.floor(inSamples * ratio);
-  const out = Buffer.alloc(outSamples * BYTES_PER_FRAME_SAMPLE);
-  for (let i = 0; i < outSamples; i++) {
-    const src = Math.min(inSamples - 1, Math.floor(i / ratio));
-    out.writeInt16LE(mono.readInt16LE(src * BYTES_PER_FRAME_SAMPLE), i * BYTES_PER_FRAME_SAMPLE);
-  }
-  return { pcm: out, sampleRate };
-}
-
 // ------------------------------------------------------------ bus client
 // v4 bus transport. Wire protocol (fixed by the brain side — do not
 // invent variants):
@@ -391,6 +348,7 @@ function decodeWavToPcm48k(buf) {
 //   Incoming: {t:'filler',seq} + binary WAV
 //             {t:'reply',seq,chunk,last,heard,text} + binary WAV
 //             {t:'skip',seq}            (no binary follows)
+//             {t:'end'}                 (stop capture and drain queued playback)
 //             {t:'ping'}                (ignored)
 // The client is deliberately policy-free: main() decides when the bus
 // is used and when to fall back to Discord. The client reports through
@@ -601,15 +559,12 @@ async function main() {
   let connection = null;
   let currentChannelId = null;
   let currentGuildId = null;
-  let tonePlayedForConnection = false;
   // v3 empty-channel tracking: non-bot users in the bot's current channel,
   // and when that set last became empty (null while anyone is present).
   let humanMembers = new Set();
   let emptySince = null;
-  // v3: the brain greets at most once per join.
-  let greetedForConnection = false;
   let finishing = false;
-  const activeSubscriptions = new Set();
+  const activeSubscriptions = new Map();
 
   const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates];
   if (VOICE_LOOP) {
@@ -633,22 +588,23 @@ async function main() {
   }
 
   async function playTone(conn) {
-    if (tonePlayedForConnection) return;
-    tonePlayedForConnection = true;
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
     const pcm = generateTonePcm(1);
     const stream = Readable.from([pcm]);
     const resource = createAudioResource(stream, { inputType: StreamType.Raw });
-    conn.subscribe(player);
-    await new Promise((resolve) => {
-      const done = () => resolve();
-      player.once('idle', done);
-      player.once('error', (e) => { log('TONE ERROR', e.message); done(); });
-      setTimeout(done, 4000); // never hang on playback
-      player.play(resource);
-    });
-    state.tonePlayed = true;
-    log('TONE PLAYED');
+    const subscription = conn.subscribe(player);
+    if (!subscription) return;
+    try {
+      const played = await playUntilIdle(player, resource, 4000, (e) => log('TONE ERROR:', e.message));
+      if (played && connection === conn && conn.state.status === VoiceConnectionStatus.Ready) {
+        state.tonePlayed = true;
+        log('TONE PLAYED');
+      } else {
+        log('TONE NOT PLAYED');
+      }
+    } finally {
+      subscription.unsubscribe();
+    }
   }
 
   // ------------------------------------------------------- v2 voice loop
@@ -697,15 +653,21 @@ async function main() {
   // whichever transport carries it; the seq is what filler / reply /
   // skip / barge frames refer back to.
   let uttSeq = 0;
-  async function maybeRelay(userId, stereoPcm, durationSec, rms) {
-    if (durationSec < 0.4 || rms < 150) return;
+  function acceptsUtterance(source) {
+    return Boolean(source) && connection === source && !finishing && !endRequested;
+  }
+
+  async function maybeRelay(userId, stereoPcm, durationSec, rms, source) {
+    if (!acceptsUtterance(source) || durationSec < 0.4 || rms < 150) return;
+    const guildId = currentGuildId;
     const seq = ++uttSeq;
     const wav = encodeWavPcm16Mono(downmixStereoToMono(stereoPcm), SAMPLE_RATE);
     const name = await getSpeakerName(userId);
+    if (!acceptsUtterance(source)) return;
     if (busClient && busClient.usable()) {
       try {
         busClient.sendUtt(
-          { seq, user: userId, name, guild: currentGuildId, lang: SESSION_LANG, dur: Number(durationSec.toFixed(2)) },
+          { seq, user: userId, name, guild: guildId, lang: SESSION_LANG, dur: Number(durationSec.toFixed(2)) },
           wav
         );
         state.relaySent++;
@@ -718,8 +680,9 @@ async function main() {
       }
     }
     const channel = await getRelayChannel();
+    if (!acceptsUtterance(source)) return;
     await channel.send({
-      content: `EARS_UTT user=${userId} name=${name} guild=${currentGuildId} lang=${SESSION_LANG}`,
+      content: `EARS_UTT user=${userId} name=${name} guild=${guildId} lang=${SESSION_LANG}`,
       files: [{ attachment: wav, name: `utt-${userId}-${Date.now()}.wav` }],
     });
     state.relaySent++;
@@ -728,7 +691,9 @@ async function main() {
 
   // Play one item now; resolves true only if it played to its natural
   // end (false on error, timeout, missing connection or barge-in).
-  function startPlayback(item) {
+  async function startPlayback(item) {
+    const conn = connection;
+    if (!conn || conn.state.status !== VoiceConnectionStatus.Ready) return false;
     // StreamType.Raw expects 48 kHz STEREO s16le (the same format the
     // tone path feeds it), so duplicate each mono sample into L+R.
     const monoPcm = item.pcm;
@@ -739,35 +704,22 @@ async function main() {
       stereo.writeInt16LE(v, i * CHANNELS * BYTES_PER_FRAME_SAMPLE);
       stereo.writeInt16LE(v, (i * CHANNELS + 1) * BYTES_PER_FRAME_SAMPLE);
     }
-    return new Promise((resolve) => {
-      if (!connection) { resolve(false); return; }
-      let rec = null;
-      let timer = null;
-      let finished = false;
-      const done = (natural) => {
-        if (finished) return;
-        finished = true;
-        if (timer) clearTimeout(timer);
-        if (rec && currentPlayback === rec) currentPlayback = null;
-        resolve(natural && !(rec && rec.barged));
-      };
-      try {
-        const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
-        const resource = createAudioResource(Readable.from([stereo]), { inputType: StreamType.Raw });
-        connection.subscribe(player);
-        rec = { player, seq: item.seq, barged: false };
-        currentPlayback = rec;
-        const timeoutMs = Math.floor(stereo.length / (SAMPLE_RATE * CHANNELS * BYTES_PER_FRAME_SAMPLE) * 1000) + 5000;
-        timer = setTimeout(() => done(true), timeoutMs); // never hang the queue
-        player.once('idle', () => done(true));
-        player.once('error', (e) => { log('PLAY FAIL:', e.message); done(false); });
-        if (item.kind === 'filler') state.fillersPlayed++;
-        player.play(resource);
-      } catch (e) {
-        log('PLAY FAIL:', e.message);
-        done(false);
-      }
-    });
+    const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+    const resource = createAudioResource(Readable.from([stereo]), { inputType: StreamType.Raw });
+    const subscription = conn.subscribe(player);
+    if (!subscription) return false;
+    const rec = { player, seq: item.seq, barged: false };
+    currentPlayback = rec;
+    try {
+      const timeoutMs = Math.floor(frames / SAMPLE_RATE * 1000) + 5000;
+      const played = await playUntilIdle(player, resource, timeoutMs, (e) => log('PLAY FAIL:', e.message));
+      const completed = played && !rec.barged && connection === conn;
+      if (completed && item.kind === 'filler') state.fillersPlayed++;
+      return completed;
+    } finally {
+      if (currentPlayback === rec) currentPlayback = null;
+      subscription.unsubscribe();
+    }
   }
 
   // Serialize reply playback: one item at a time, in arrival order.
@@ -775,13 +727,13 @@ async function main() {
   // replies as whole messages; both feed this same FIFO, so a later
   // seq's chunks can never overtake an earlier unfinished seq.
   function pumpReplyQueue() {
-    if (currentPlayback) return;
+    if (finishing || currentPlayback) return;
     const item = replyQueue.shift();
     if (!item) return;
     startPlayback(item)
       .then((natural) => {
-        if (item.kind === 'reply') {
-          if (item.countReply && natural) state.repliesPlayed++;
+        if (item.kind === 'reply' && natural) {
+          if (item.countReply) state.repliesPlayed++;
           log(`REPLY PLAYED seq=${item.seq} bytes=${item.pcm.length}`);
         }
       })
@@ -811,6 +763,7 @@ async function main() {
   function requestGracefulEnd() {
     if (endRequested || finishing) return;
     endRequested = true;
+    for (const { opusStream } of activeSubscriptions.values()) opusStream.destroy();
     const requestedAt = Date.now();
     const tick = () => {
       if (finishing) return;
@@ -838,7 +791,7 @@ async function main() {
     if (bargeTimers.has(userId)) return;
     const timer = setTimeout(() => {
       bargeTimers.delete(userId);
-      if (!currentPlayback) return;
+      if (endRequested || !currentPlayback) return;
       const last = lastSpeechAt.get(userId) || 0;
       if (Date.now() - last > 450) return; // already stopped talking
       const seqPlaying = currentPlayback.seq;
@@ -876,19 +829,20 @@ async function main() {
   }
 
   function subscribeToUser(userId) {
-    if (!connection || userId === client.user.id) return;
-    if (activeSubscriptions.has(userId)) return;
-    activeSubscriptions.add(userId);
+    const source = connection;
+    if (!acceptsUtterance(source) || userId === client.user.id) return;
+    if (activeSubscriptions.get(userId)?.source === source) return;
     let opusStream;
     try {
-      opusStream = connection.receiver.subscribe(userId, {
+      opusStream = source.receiver.subscribe(userId, {
         end: { behavior: EndBehaviorType.AfterSilence, duration: 650 },
       });
     } catch (e) {
-      activeSubscriptions.delete(userId);
       log(`SUBSCRIBE FAIL user=${userId}:`, e.message);
       return;
     }
+    const subscription = { source, opusStream };
+    activeSubscriptions.set(userId, subscription);
     // v4 force-flush: one continuous 20 s stream is cut so the normal
     // end/close path fires with the audio collected so far — a single
     // monologue must not stall the whole room behind it. The usual
@@ -912,6 +866,7 @@ async function main() {
       getSpeakerName(userId).then((n) => { live.name = n; }).catch(() => {});
     }
     opusStream.on('data', (packet) => {
+      if (!acceptsUtterance(source)) return;
       try {
         const out = decoder.decode(packet);
         if (!out || !out.length) return;
@@ -947,8 +902,8 @@ async function main() {
       utteranceFinished = true;
       clearTimeout(flushTimer);
       try { decoder.delete(); } catch (_) {}
-      activeSubscriptions.delete(userId);
-      if (pcmBytes === 0 || sampleCount === 0) return;
+      if (activeSubscriptions.get(userId) === subscription) activeSubscriptions.delete(userId);
+      if (!acceptsUtterance(source) || pcmBytes === 0 || sampleCount === 0) return;
       const durationSec = pcmBytes / (SAMPLE_RATE * CHANNELS * BYTES_PER_FRAME_SAMPLE);
       const rms = Math.sqrt(sumSq / sampleCount);
       const row = {
@@ -976,9 +931,10 @@ async function main() {
           // speech still reaches the brain exactly once.
           (async () => {
             try {
-              if (!busClient || !busClient.usable()) throw new Error('bus down at segment end');
+              if (!acceptsUtterance(source)) return;
+              if (live.dead || !busClient || !busClient.usable()) throw new Error('bus down during segment');
               if (live.buf.length > 0) {
-                busClient.sendPcm(userId, live.name || (await getSpeakerName(userId)), live.buf);
+                busClient.sendPcm(userId, live.name || 'unknown', live.buf);
                 state.pcmFramesSent++;
                 live.buf = Buffer.alloc(0);
               }
@@ -986,12 +942,12 @@ async function main() {
               log(`LIVE SEGMENT END user=${userId} dur=${row.duration_sec}`);
             } catch (e) {
               log(`LIVE END FALLBACK user=${userId}: ${e.message}; relaying utterance instead`);
-              await maybeRelay(userId, fullPcm, row.duration_sec, rms);
+              await maybeRelay(userId, fullPcm, row.duration_sec, rms, source);
             }
           })().catch((e) => log('RELAY SEND FAIL:', e.message));
         } else {
           // Fire-and-forget: relaying must never block the receive loop.
-          maybeRelay(userId, fullPcm, row.duration_sec, rms)
+          maybeRelay(userId, fullPcm, row.duration_sec, rms, source)
             .catch((e) => log('RELAY SEND FAIL:', e.message));
         }
       }
@@ -1019,47 +975,60 @@ async function main() {
   }
 
   async function joinChannel(guild, channelId, phase) {
-    if (connection && currentChannelId === channelId) return;
+    if (finishing || endRequested || (connection && currentChannelId === channelId)) return;
     if (connection) {
-      try { connection.destroy(); } catch (_) {}
+      replyQueue.length = 0;
+      if (currentPlayback) {
+        currentPlayback.barged = true;
+        try { currentPlayback.player.stop(true); } catch (_) {}
+      }
+      const previous = connection;
       connection = null;
+      try { previous.destroy(); } catch (_) {}
     }
-    tonePlayedForConnection = false;
-    greetedForConnection = false;
-    connection = joinVoiceChannel({
+    const joined = joinVoiceChannel({
       channelId,
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: false,
       selfMute: false,
     });
+    connection = joined;
     currentChannelId = channelId;
     currentGuildId = guild.id;
-    connection.on('stateChange', (oldS, newS) => {
+    joined.on('stateChange', (oldS, newS) => {
       state.connectionStates.add(newS.status);
-      log(`VC STATE ${oldS.status} -> ${newS.status} (${daveStatus(connection)})`);
+      log(`VC STATE ${oldS.status} -> ${newS.status} (${daveStatus(joined)})`);
     });
-    connection.on('error', (e) => log('VC ERROR:', e.message));
+    joined.on('error', (e) => log('VC ERROR:', e.message));
     // Receive path: subscribe per speaking user.
-    connection.receiver.speaking.on('start', (userId) => {
-      if (userId === client.user.id) return;
+    joined.receiver.speaking.on('start', (userId) => {
+      if (!acceptsUtterance(joined) || userId === client.user.id) return;
       subscribeToUser(userId);
       maybeScheduleBarge(userId);
     });
     log(`JOINING channel=${channelId} guild=${guild.id} phase=${phase}`);
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-      log(`VC READY channel=${channelId} (${daveStatus(connection)})`);
+      await entersState(joined, VoiceConnectionStatus.Ready, 30_000);
     } catch (e) {
       log('VC READY TIMEOUT:', e.message);
+      if (connection === joined && !finishing) {
+        connection = null;
+        currentChannelId = null;
+        currentGuildId = null;
+        joined.destroy();
+      }
+      return;
     }
-    await playTone(connection);
+    if (finishing || endRequested || connection !== joined) return;
+    log(`VC READY channel=${channelId} (${daveStatus(joined)})`);
     // v3: start the empty-channel clock from whoever is already here.
     refreshHumans(guild, channelId);
+    await playTone(joined);
+    if (finishing || endRequested || connection !== joined) return;
     // v3: ask the brain to greet the room, once per join. Fire-and-
     // forget so a slow relay post can never stall the receiver.
-    if (VOICE_LOOP && !greetedForConnection) {
-      greetedForConnection = true;
+    if (VOICE_LOOP) {
       (async () => {
         // Bus first when it is live; the Discord greet is the fallback
         // (bus down, not configured, or the send itself threw).
@@ -1085,18 +1054,15 @@ async function main() {
     }
   }
 
-  async function gitPushResults() {
-    // Best-effort: commit + push results/ back to the repo (Codespaces has
-    // git credentials for the repo it was created from). Never fatal.
-    const cmd = 'git config user.email "ears@kornol.local"; git config user.name "KORNOL ears"; ' +
-      'git add results && (git diff --cached --quiet || git commit -m "ears test results") && git push origin HEAD:main';
-    return new Promise((resolve) => {
-      exec(cmd, { cwd: BASE, timeout: 60_000 }, (err, stdout, stderr) => {
-        if (err) log('GIT PUSH FAILED (best-effort):', (stderr || err.message || '').toString().trim().slice(0, 300));
-        else log('GIT PUSH OK');
-        resolve();
-      });
-    });
+  const publishResults = createResultsPublisher(BASE);
+
+  async function gitPushResults(message) {
+    try {
+      await publishResults(message);
+      log('GIT PUSH OK');
+    } catch (_) {
+      log('GIT PUSH FAILED (best-effort)');
+    }
   }
 
   let botMoved = false;
@@ -1105,6 +1071,11 @@ async function main() {
     if (finishing) return;
     finishing = true;
     log(`FINISHING reason=${reason}`);
+    replyQueue.length = 0;
+    if (currentPlayback) {
+      currentPlayback.barged = true;
+      try { currentPlayback.player.stop(true); } catch (_) {}
+    }
     const summary = {
       started_at: state.startedAt,
       finished_at: new Date().toISOString(),
@@ -1132,8 +1103,9 @@ async function main() {
       log('SUMMARY WRITE FAIL:', e.message);
     }
     try { if (connection) connection.destroy(); } catch (_) {}
-    await gitPushResults();
+    if (busClient) busClient.close();
     try { client.destroy(); } catch (_) {}
+    await gitPushResults('ears test results');
     process.exit(0);
   }
 
@@ -1164,20 +1136,13 @@ async function main() {
     }
   }, 30_000);
 
-  // Progress phone-home: every 45s, force-add the live log + utterance
-  // records and push, so progress is visible from outside the codespace
-  // while the run is still going. Best-effort, never fatal, no overlap.
+  // Publish progress while the session is running. Final publication
+  // queues behind any in-flight progress update.
   let progressInFlight = false;
   setInterval(() => {
     if (progressInFlight || finishing) return;
     progressInFlight = true;
-    const cmd = 'git config user.email "ears@kornol.local"; git config user.name "KORNOL ears"; ' +
-      'git add -f results/run.log results/utterances.jsonl results/summary.json 2>/dev/null; ' +
-      '(git diff --cached --quiet || git commit -m "ears progress") && git push origin HEAD:main';
-    exec(cmd, { cwd: BASE, timeout: 45_000 }, (err) => {
-      if (err) log('PROGRESS PUSH FAILED (best-effort)');
-      progressInFlight = false;
-    });
+    gitPushResults('ears progress').finally(() => { progressInFlight = false; });
   }, 45_000);
 
   client.once(Events.ClientReady, async (c) => {
@@ -1187,10 +1152,10 @@ async function main() {
     if (TEST_VOICE_CHANNEL_ID) {
       try {
         const channel = await client.channels.fetch(TEST_VOICE_CHANNEL_ID);
-        if (channel && channel.guild) {
+        if (channel?.isVoiceBased() && channel.guild && (!TEST_GUILD_ID || channel.guild.id === TEST_GUILD_ID)) {
           await joinChannel(channel.guild, channel.id, 'A');
         } else {
-          log(`PHASE A FAIL: channel ${TEST_VOICE_CHANNEL_ID} not found or not in a guild`);
+          log(`PHASE A FAIL: channel ${TEST_VOICE_CHANNEL_ID} is not a voice channel in the configured guild`);
         }
       } catch (e) {
         log('PHASE A ERROR:', e.message);
@@ -1203,10 +1168,9 @@ async function main() {
   // Phase B: follow the owner into a voice channel in the test guild.
   client.on(Events.VoiceStateUpdate, async (oldS, newS) => {
     try {
-      if (!OWNER_USER_ID) return;
-      if (newS.member && newS.member.user && newS.member.user.id !== OWNER_USER_ID) return;
-      if (!newS.channelId) return; // owner left voice
-      if (TEST_GUILD_ID && newS.guild.id !== TEST_GUILD_ID) return;
+      if (!OWNER_USER_ID || !TEST_GUILD_ID) return;
+      if (newS.id !== OWNER_USER_ID || newS.guild.id !== TEST_GUILD_ID) return;
+      if (!newS.channelId || newS.channelId === oldS.channelId) return;
       if (currentChannelId === newS.channelId) return;
       await joinChannel(newS.guild, newS.channelId, 'B');
     } catch (e) {
@@ -1227,7 +1191,7 @@ async function main() {
         // her watching a room she was no longer in (live incident
         // 2026-11-12: dragged to another channel, sat alone until the
         // runtime cap). End the session instead.
-        if (newS.channelId !== currentChannelId) {
+        if (oldS.channelId === currentChannelId && newS.channelId !== currentChannelId) {
           botMoved = true;
           log(`BOT MOVED joined=${currentChannelId} now=${newS.channelId}`);
           finish('bot moved');
@@ -1253,14 +1217,13 @@ async function main() {
   // v2 relay replies: an EARS_REPLY message in the relay channel with a
   // .wav attachment is the brain's answer — play it into the voice
   // channel. NOTE: replies are posted by a separate process using the
-  // SAME bot account, so there is deliberately NO author filter here;
-  // the guards are the channel id, the EARS_REPLY prefix, and "newer
-  // than this process start". The bot's own EARS_UTT uploads never
-  // match the prefix, so they cannot trigger playback.
+  // same bot account. Restrict playback to that account in the relay
+  // channel, and accept only messages sent during this session.
   client.on(Events.MessageCreate, async (msg) => {
     try {
-      if (!VOICE_LOOP) return;
+      if (!VOICE_LOOP || finishing) return;
       if (!msg || msg.channelId !== RELAY_CHANNEL_ID) return;
+      if (!client.user || msg.author?.id !== client.user.id) return;
       if (typeof msg.content !== 'string') return;
       const isReply = msg.content.startsWith('EARS_REPLY');
       const isFiller = !isReply && msg.content.startsWith('EARS_FILLER');
